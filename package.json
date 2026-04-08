@@ -1,0 +1,15 @@
+{
+  "name": "muddy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Starter DBZ-style MUD server scaffold",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
