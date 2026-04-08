@@ -1,0 +1,667 @@
+const net = require('net');
+const config = require('./src/config');
+const starterRooms = require('./src/world/rooms');
+const worldState = require('./src/world/state');
+const { createStarterStats } = require('./src/world/playerFactory');
+const { loadPlayers, savePlayers } = require('./src/world/storage');
+const { getTechnique } = require('./src/world/techniques');
+const { getItem } = require('./src/world/items');
+const { ensureCombatState, canUseTechnique, setTechniqueCooldown, computeDamage, spendTechniqueCost } = require('./src/world/combat');
+const { ensureRealtimeState, registerSession, unregisterSession } = require('./src/world/realtime');
+const { ensureRoomRuntime, addPlayerToRoom, removePlayerFromRoom, movePlayerRoom, getRoomPlayerIds, broadcastToRoom } = require('./src/world/roomsRuntime');
+const { ensureSpawnState, getEnemiesForRoom, findEnemyInRoom, removeDefeatedEnemies, scheduleRoomRespawn } = require('./src/world/spawns');
+const { findPlayerInRoom, canAttackPlayer, handlePlayerDefeat } = require('./src/world/pvp');
+const { ensurePartyState, findPartyByMember, inviteToParty, acceptPartyInvite, leaveParty, disbandParty, listPartyMembers, areGrouped } = require('./src/world/parties');
+const { ensurePartyCombatState, setFollowTarget, clearFollowTarget, getFollowersOf, splitPartyExp, getAssistantsInRoom } = require('./src/world/partyCombat');
+const { ensureInventory, addItemToInventory, renderInventory, rollLoot, useItem } = require('./src/world/inventory');
+const { ensureEquipment, equipItem, unequipItem, getEquipmentBonuses, renderEquipment, renderVendorStock, findVendorEntry } = require('./src/world/equipment');
+const { ensureProgression, applyRacePerk, grantLevelSkillPoint, learnTechnique, renderProgression } = require('./src/world/progression');
+
+const runtimeItems = {
+  'basic-scouter': { id: 'basic-scouter', name: 'Basic Scouter', kind: 'equipment', slot: 'scouter', description: 'A starter scouter with modest combat support.', bonuses: { powerLevel: 3, ki: 1 } },
+  'training-weights': { id: 'training-weights', name: 'Training Weights', kind: 'equipment', slot: 'accessory', description: 'Weighted gear that improves striking power.', bonuses: { strength: 1, offense: 1 } },
+  'guard-wraps': { id: 'guard-wraps', name: 'Guard Wraps', kind: 'equipment', slot: 'armor', description: 'Basic wraps that soften incoming blows.', bonuses: { defense: 2, endurance: 1 } },
+};
+const originalGetItem = getItem;
+function getItemRuntime(id) { return runtimeItems[id] || originalGetItem(id); }
+
+for (const room of starterRooms) worldState.rooms.set(room.id, room);
+ensureRealtimeState(worldState);
+ensureRoomRuntime(worldState);
+ensureSpawnState(worldState);
+ensurePartyState(worldState);
+ensurePartyCombatState(worldState);
+const persistedPlayers = loadPlayers();
+
+function prompt(socket, text = '> ') { if (!socket.destroyed) socket.write(text); }
+function writeLine(socket, text = '') { if (!socket.destroyed) socket.write(`${text}\r\n`); }
+
+function persistPlayer(player) {
+  ensureInventory(player);
+  ensureEquipment(player);
+  ensureProgression(player);
+  persistedPlayers[player.name] = {
+    id: player.id,
+    name: player.name,
+    race: player.race,
+    roomId: player.roomId,
+    hp: player.hp,
+    maxHp: player.maxHp,
+    kiPool: player.kiPool,
+    maxKiPool: player.maxKiPool,
+    exp: player.exp || 0,
+    level: player.level || 1,
+    stats: player.stats,
+    cooldowns: player.cooldowns || {},
+    pvpEnabled: player.pvpEnabled !== false,
+    inventory: player.inventory || [],
+    equipment: player.equipment || {},
+    zeni: player.zeni || 0,
+    learnedTechniques: player.learnedTechniques || [],
+    skillPoints: player.skillPoints || 0,
+    racePerkApplied: !!player.racePerkApplied,
+  };
+  savePlayers(persistedPlayers);
+}
+
+function createNewPlayer(name, race) {
+  const p = {
+    id: `char-${name}`,
+    name,
+    race,
+    roomId: 'start',
+    hp: 100,
+    maxHp: 100,
+    kiPool: 50,
+    maxKiPool: 50,
+    exp: 0,
+    level: 1,
+    stats: createStarterStats(race),
+    cooldowns: {},
+    pvpEnabled: true,
+    inventory: [],
+    equipment: { scouter: null, armor: null, accessory: null },
+    zeni: 25,
+    learnedTechniques: [],
+    skillPoints: 0,
+    racePerkApplied: false,
+    socket: null,
+    buffer: '',
+  };
+  ensureCombatState(p);
+  ensureInventory(p);
+  ensureEquipment(p);
+  ensureProgression(p);
+  applyRacePerk(p);
+  return p;
+}
+
+function attachPlayer(profile, socket) {
+  const p = {
+    ...profile,
+    socket,
+    buffer: '',
+    cooldowns: profile.cooldowns || {},
+    pvpEnabled: profile.pvpEnabled !== false,
+    inventory: profile.inventory || [],
+    equipment: profile.equipment || { scouter: null, armor: null, accessory: null },
+    zeni: profile.zeni || 0,
+    learnedTechniques: profile.learnedTechniques || [],
+    skillPoints: profile.skillPoints || 0,
+    racePerkApplied: !!profile.racePerkApplied,
+  };
+  ensureCombatState(p);
+  ensureInventory(p);
+  ensureEquipment(p);
+  ensureProgression(p);
+  applyRacePerk(p);
+  return p;
+}
+
+function effectiveStats(player) {
+  const bonuses = getEquipmentBonuses(player);
+  return {
+    powerLevel: (player.stats.powerLevel || 0) + (bonuses.powerLevel || 0),
+    strength: (player.stats.strength || 0) + (bonuses.strength || 0),
+    endurance: (player.stats.endurance || 0) + (bonuses.endurance || 0),
+    speed: (player.stats.speed || 0) + (bonuses.speed || 0),
+    ki: (player.stats.ki || 0) + (bonuses.ki || 0),
+    offense: (player.stats.offense || 0) + (bonuses.offense || 0),
+    defense: (player.stats.defense || 0) + (bonuses.defense || 0),
+  };
+}
+
+function roomBroadcast(roomId, message, excludePlayerId = null) {
+  broadcastToRoom(worldState, roomId, worldState.players, writeLine, message, excludePlayerId);
+}
+
+function grantExp(player, amount) {
+  player.exp += amount;
+  const need = player.level * 25;
+  if (player.exp >= need) {
+    player.level += 1;
+    player.maxHp += 10;
+    player.hp = player.maxHp;
+    player.maxKiPool += 5;
+    player.kiPool = player.maxKiPool;
+    player.stats.powerLevel += 2;
+    player.stats.strength += 1;
+    player.stats.offense += 1;
+    player.stats.ki += 1;
+    grantLevelSkillPoint(player);
+    return `\r\nYou have reached level ${player.level}! You gain 1 skill point.`;
+  }
+  return '';
+}
+
+function distributePartyExp(sourcePlayer, totalExp) {
+  const party = findPartyByMember(worldState, sourcePlayer.id);
+  if (!party) {
+    const lt = grantExp(sourcePlayer, totalExp);
+    persistPlayer(sourcePlayer);
+    return `You gain ${totalExp} EXP.${lt}`;
+  }
+  const shares = splitPartyExp(worldState, party, worldState.players, totalExp)
+    .filter(({ player }) => player.roomId === sourcePlayer.roomId || player.id === sourcePlayer.id);
+  const results = [];
+  for (const { player, exp } of shares) {
+    const lt = grantExp(player, exp);
+    persistPlayer(player);
+    if (player.id === sourcePlayer.id) results.push(`You gain ${exp} shared EXP.${lt}`);
+    else if (player.socket && !player.socket.destroyed) writeLine(player.socket, `You gain ${exp} shared party EXP.${lt}`);
+  }
+  return results.join('\r\n');
+}
+
+function awardLoot(sourcePlayer, enemyId) {
+  const party = findPartyByMember(worldState, sourcePlayer.id);
+  const drops = rollLoot(enemyId);
+  if (!drops.length) return 'No loot dropped.';
+  const recipients = party
+    ? Array.from(party.memberIds).map((id) => worldState.players.get(id)).filter((p) => p && p.roomId === sourcePlayer.roomId)
+    : [sourcePlayer];
+  const receiver = recipients[0] || sourcePlayer;
+  for (const drop of drops) addItemToInventory(receiver, drop, 1);
+  receiver.zeni = (receiver.zeni || 0) + 5;
+  persistPlayer(receiver);
+  return drops.map((id) => `${(getItemRuntime(id) || {}).name || id} obtained.`).join('\r\n') + `\r\n${receiver.name} gains 5 zeni.`;
+}
+
+function otherPlayersText(viewer) {
+  const others = getRoomPlayerIds(worldState, viewer.roomId)
+    .map((id) => worldState.players.get(id))
+    .filter((p) => p && p.id !== viewer.id)
+    .map((p) => `${p.name}${p.pvpEnabled ? '' : ' [safe]'}${areGrouped(worldState, viewer.id, p.id) ? ' [party]' : ''}`);
+  return others.length ? `Players here: ${others.join(', ')}` : 'Players here: none';
+}
+
+function enemiesText(roomId) {
+  const enemies = getEnemiesForRoom(worldState, roomId).filter((e) => e.hp > 0);
+  return enemies.length ? `Enemies: ${enemies.map((e) => `${e.name} [${e.uid}] ${e.hp}/${e.maxHp}`).join(' | ')}` : 'Enemies: none';
+}
+
+function renderRoom(player) {
+  const room = worldState.rooms.get(player.roomId);
+  const exits = Object.keys(room.exits || {});
+  return [room.name, room.description, `Exits: ${exits.length ? exits.join(', ') : 'none'}`, otherPlayersText(player), enemiesText(player.roomId)].join('\r\n');
+}
+
+function renderStats(player) {
+  const s = effectiveStats(player);
+  return [
+    `Name: ${player.name}`,
+    `Race: ${player.race}`,
+    `Level: ${player.level}`,
+    `EXP: ${player.exp}`,
+    `Zeni: ${player.zeni || 0}`,
+    `HP: ${player.hp}/${player.maxHp}`,
+    `Ki: ${player.kiPool}/${player.maxKiPool}`,
+    `PvP: ${player.pvpEnabled ? 'on' : 'off'}`,
+    `Power Level: ${s.powerLevel}`,
+    `STR ${s.strength} | END ${s.endurance} | SPD ${s.speed}`,
+    `KI ${s.ki} | OFF ${s.offense} | DEF ${s.defense}`,
+  ].join('\r\n');
+}
+
+function moveFollowers(leader, fromRoom, toRoom) {
+  const followerIds = getFollowersOf(worldState, leader.id);
+  for (const followerId of followerIds) {
+    const follower = worldState.players.get(followerId);
+    if (!follower || follower.roomId !== fromRoom) continue;
+    movePlayerRoom(worldState, follower, fromRoom, toRoom);
+    follower.roomId = toRoom;
+    persistPlayer(follower);
+    if (follower.socket && !follower.socket.destroyed) {
+      writeLine(follower.socket, `You follow ${leader.name} to ${toRoom}.`);
+      writeLine(follower.socket, renderRoom(follower));
+      prompt(follower.socket);
+    }
+  }
+}
+
+function movePlayer(player, direction) {
+  const room = worldState.rooms.get(player.roomId);
+  if (!room.exits[direction]) return `You cannot go ${direction}.`;
+  const fromRoom = player.roomId, toRoom = room.exits[direction];
+  movePlayerRoom(worldState, player, fromRoom, toRoom);
+  player.roomId = toRoom;
+  persistPlayer(player);
+  moveFollowers(player, fromRoom, toRoom);
+  roomBroadcast(fromRoom, `${player.name} leaves ${direction}.`, player.id);
+  roomBroadcast(toRoom, `${player.name} arrives.`, player.id);
+  return renderRoom(player);
+}
+
+function applyAssistDamage(attacker, enemy) {
+  const party = findPartyByMember(worldState, attacker.id);
+  const assistants = getAssistantsInRoom(worldState, party, worldState.players, attacker.roomId, attacker.id);
+  if (!assistants.length) return { total: 0, lines: [] };
+  const lines = [];
+  let total = 0;
+  for (const helper of assistants) {
+    const tech = getTechnique('punch');
+    const check = canUseTechnique(helper, 'punch');
+    if (!check.ok) continue;
+    spendTechniqueCost(helper, tech);
+    setTechniqueCooldown(helper, tech.id, tech.cooldownMs);
+    const dmg = Math.max(1, Math.floor(computeDamage({ ...helper, stats: effectiveStats(helper) }, enemy, tech) / 2));
+    enemy.hp = Math.max(0, enemy.hp - dmg);
+    total += dmg;
+    lines.push(`${helper.name} assists for ${dmg} damage.`);
+    persistPlayer(helper);
+  }
+  return { total, lines };
+}
+
+function applyLearnedTechniqueEffects(player, techniqueId, damage) {
+  const extraLines = [];
+  let finalDamage = damage;
+  if (player.learnedTechniques && player.learnedTechniques.includes('rage-spike') && techniqueId === 'punch') {
+    finalDamage += 3;
+    extraLines.push('Rage Spike adds 3 damage.');
+  }
+  if (player.learnedTechniques && player.learnedTechniques.includes('focus-burst') && (techniqueId === 'blast' || techniqueId === 'beam')) {
+    finalDamage += 4;
+    extraLines.push('Focus Burst amplifies your ki attack by 4 damage.');
+  }
+  if (player.learnedTechniques && player.learnedTechniques.includes('overclock') && (techniqueId === 'kick' || techniqueId === 'blast')) {
+    finalDamage += 2;
+    player.kiPool = Math.min(player.maxKiPool, player.kiPool + 2);
+    extraLines.push('Overclock increases damage and refunds 2 ki.');
+  }
+  return { finalDamage, extraLines };
+}
+
+function useTechniqueOnEnemy(player, techniqueId, targetText) {
+  const enemy = findEnemyInRoom(worldState, player.roomId, targetText);
+  if (!enemy) return null;
+  const check = canUseTechnique(player, techniqueId);
+  if (!check.ok) return check.reason;
+  const technique = check.technique;
+  spendTechniqueCost(player, technique);
+  setTechniqueCooldown(player, technique.id, technique.cooldownMs);
+  let damage = computeDamage({ ...player, stats: effectiveStats(player) }, enemy, technique);
+  const mod = applyLearnedTechniqueEffects(player, techniqueId, damage);
+  damage = mod.finalDamage;
+  enemy.hp = Math.max(0, enemy.hp - damage);
+  const lines = [`You ${technique.verb} ${enemy.name} for ${damage} damage.`, ...mod.extraLines];
+  roomBroadcast(player.roomId, `${player.name} ${technique.verb} ${enemy.name} for ${damage} damage.`, player.id);
+  const assist = applyAssistDamage(player, enemy);
+  if (assist.total > 0) {
+    lines.push(...assist.lines);
+    roomBroadcast(player.roomId, `${player.name}'s party adds ${assist.total} assist damage to ${enemy.name}.`, player.id);
+  }
+  if (enemy.hp <= 0) {
+    lines.push(`${enemy.name} is defeated.`);
+    roomBroadcast(player.roomId, `${enemy.name} is defeated by ${player.name}'s party.`, player.id);
+    removeDefeatedEnemies(worldState, player.roomId);
+    if (getEnemiesForRoom(worldState, player.roomId).length === 0) scheduleRoomRespawn(worldState, player.roomId, 15000);
+    lines.push(distributePartyExp(player, enemy.expReward || 5));
+    lines.push(awardLoot(player, enemy.id));
+  } else {
+    persistPlayer(player);
+  }
+  return lines.join('\r\n');
+}
+
+function useTechniqueOnPlayer(player, techniqueId, targetText) {
+  const target = findPlayerInRoom(worldState, player.roomId, targetText, player.id);
+  if (!target) return 'No player target here by that name.';
+  if (areGrouped(worldState, player.id, target.id)) return `${target.name} is in your party.`;
+  if (!player.pvpEnabled) return 'Your PvP flag is off.';
+  if (!target.pvpEnabled) return `${target.name} is in safe mode.`;
+  const allowed = canAttackPlayer(player, target);
+  if (!allowed.ok) return allowed.reason;
+  const check = canUseTechnique(player, techniqueId);
+  if (!check.ok) return check.reason;
+  const technique = check.technique;
+  spendTechniqueCost(player, technique);
+  setTechniqueCooldown(player, technique.id, technique.cooldownMs);
+  let damage = computeDamage({ ...player, stats: effectiveStats(player) }, { ...target, stats: effectiveStats(target) }, technique);
+  const mod = applyLearnedTechniqueEffects(player, techniqueId, damage);
+  damage = mod.finalDamage;
+  target.hp = Math.max(0, target.hp - damage);
+  let text = `You ${technique.verb} ${target.name} for ${damage} damage.`;
+  if (mod.extraLines.length) text += `\r\n${mod.extraLines.join('\r\n')}`;
+  writeLine(target.socket, `${player.name} ${technique.verb} you for ${damage} damage.`);
+  roomBroadcast(player.roomId, `${player.name} ${technique.verb} ${target.name} for ${damage} damage.`, player.id);
+  if (target.hp <= 0) {
+    const result = handlePlayerDefeat(player, target);
+    movePlayerRoom(worldState, target, player.roomId, 'start');
+    text += `\r\n${result.message}`;
+    text += `\r\n${distributePartyExp(player, result.reward)}`;
+    writeLine(target.socket, 'You were defeated and wake up back at the Training Grounds.');
+    roomBroadcast(player.roomId, `${target.name} is defeated by ${player.name}.`, player.id);
+    persistPlayer(target);
+  }
+  persistPlayer(player);
+  persistPlayer(target);
+  return text;
+}
+
+function useTechnique(player, techniqueId, targetText) {
+  if (targetText) {
+    const pvpResult = useTechniqueOnPlayer(player, techniqueId, targetText);
+    if (pvpResult !== 'No player target here by that name.') return pvpResult;
+  }
+  const pveResult = useTechniqueOnEnemy(player, techniqueId, targetText);
+  if (pveResult) return pveResult;
+  return 'No valid target here.';
+}
+
+function handleScan(player) {
+  const enemies = getEnemiesForRoom(worldState, player.roomId).filter((e) => e.hp > 0);
+  const players = getRoomPlayerIds(worldState, player.roomId)
+    .map((id) => worldState.players.get(id))
+    .filter((p) => p && p.id !== player.id)
+    .map((p) => `${p.name} | PL ${effectiveStats(p).powerLevel} | HP ${p.hp}/${p.maxHp} | PvP ${p.pvpEnabled ? 'on' : 'off'}${areGrouped(worldState, player.id, p.id) ? ' | PARTY' : ''}`);
+  const lines = [];
+  if (players.length) lines.push(...players);
+  if (enemies.length) lines.push(...enemies.map((e) => `${e.name} [${e.uid}] | PL ${e.powerLevel} | HP ${e.hp}/${e.maxHp} | Ki ${e.kiPool}/${e.maxKiPool}`));
+  return lines.length ? lines.join('\r\n') : 'Your scouter finds no targets here.';
+}
+
+function handleSay(player, input) {
+  const msg = input.slice(4).trim();
+  if (!msg) return 'Say what?';
+  roomBroadcast(player.roomId, `${player.name} says: ${msg}`, player.id);
+  return `You say: ${msg}`;
+}
+
+function handleWho() {
+  const names = Array.from(worldState.players.values()).map((p) => `${p.name}${p.pvpEnabled ? '' : ' [safe]'}`);
+  return names.length ? `Online: ${names.join(', ')}` : 'Online: none';
+}
+
+function handlePvpToggle(player, value) {
+  if (!value) return `PvP is currently ${player.pvpEnabled ? 'on' : 'off'}.`;
+  const n = value.toLowerCase();
+  if (n === 'on') player.pvpEnabled = true;
+  else if (n === 'off') player.pvpEnabled = false;
+  else return 'Use: pvp on|off';
+  persistPlayer(player);
+  return `PvP is now ${player.pvpEnabled ? 'on' : 'off'}.`;
+}
+
+function handlePartyInvite(player, targetText) {
+  const target = findPlayerInRoom(worldState, player.roomId, targetText, player.id);
+  if (!target) return 'No player target here by that name.';
+  inviteToParty(worldState, player, target);
+  writeLine(target.socket, `${player.name} invites you to a party. Type: party accept ${player.name}`);
+  return `You invite ${target.name} to your party.`;
+}
+
+function handlePartyAccept(player, inviterText) {
+  const inviter = findPlayerInRoom(worldState, player.roomId, inviterText, player.id) || Array.from(worldState.players.values()).find((p) => p && p.name.toLowerCase() === String(inviterText || '').trim().toLowerCase());
+  if (!inviter) return 'That inviter is not online.';
+  const result = acceptPartyInvite(worldState, player, inviter);
+  if (!result.ok) return result.reason;
+  writeLine(inviter.socket, `${player.name} joins your party.`);
+  return `You join ${inviter.name}'s party.`;
+}
+
+function handlePartyLeave(player) {
+  const party = findPartyByMember(worldState, player.id);
+  if (!party) return 'You are not in a party.';
+  clearFollowTarget(worldState, player.id);
+  const wasLeader = party.leaderId === player.id;
+  leaveParty(worldState, player.id);
+  return wasLeader ? 'You leave the party. Leadership passes if members remain.' : 'You leave the party.';
+}
+
+function handlePartyDisband(player) {
+  const result = disbandParty(worldState, player.id);
+  if (!result) return 'You are not in a party.';
+  if (!result.ok) return result.reason;
+  return 'You disband the party.';
+}
+
+function handlePartyList(player) {
+  const members = listPartyMembers(worldState, worldState.players, player.id);
+  if (!members) return 'You are not in a party.';
+  return members.map((m) => `${m.name}${m.leader ? ' [leader]' : ''} | room ${m.roomId} | HP ${m.hp}/${m.maxHp}`).join('\r\n');
+}
+
+function handleFollow(player, leaderText) {
+  const leader = findPlayerInRoom(worldState, player.roomId, leaderText, player.id);
+  if (!leader) return 'No player target here by that name.';
+  if (!areGrouped(worldState, player.id, leader.id)) return 'You can only follow a party member.';
+  setFollowTarget(worldState, player.id, leader.id);
+  return `You now follow ${leader.name}.`;
+}
+
+function handleUnfollow(player) { clearFollowTarget(worldState, player.id); return 'You stop following.'; }
+function handleInventory(player) { return renderInventory(player); }
+function normalizeKey(text) { return String(text || '').trim().toLowerCase().replace(/\s+/g, '-'); }
+
+function handleUse(player, itemText) {
+  const key = normalizeKey(itemText);
+  if (!key) return 'Use what?';
+  if (key === 'meditate') {
+    const before = player.hp;
+    player.hp = Math.min(player.maxHp, player.hp + 12);
+    let extra = '';
+    if (player.learnedTechniques && player.learnedTechniques.includes('regen-stance')) {
+      const prior = player.hp;
+      player.hp = Math.min(player.maxHp, player.hp + 10);
+      extra = `\r\nRegen Stance restores an extra ${player.hp - prior} HP.`;
+    }
+    persistPlayer(player);
+    return `You meditate and recover ${player.hp - before} HP.${extra}`;
+  }
+  const result = useItem(player, key);
+  if (!result.ok) return result.reason;
+  persistPlayer(player);
+  return result.text;
+}
+
+function handleEquipment(player) { return renderEquipment(player); }
+
+function handleEquip(player, itemText) {
+  const key = normalizeKey(itemText);
+  if (!key) return 'Equip what?';
+  ensureInventory(player);
+  const has = (player.inventory || []).some((entry) => entry.itemId === key && entry.qty > 0);
+  if (!has) return 'You do not have that item.';
+  const result = equipItem(player, key);
+  if (!result.ok) return result.reason;
+  const slot = player.inventory.find((entry) => entry.itemId === key && entry.qty > 0);
+  if (slot) {
+    slot.qty -= 1;
+    if (slot.qty <= 0) player.inventory = player.inventory.filter((e) => e !== slot);
+  }
+  if (result.previous) addItemToInventory(player, result.previous, 1);
+  persistPlayer(player);
+  return `${result.item.name} equipped to ${result.slot}.`;
+}
+
+function handleUnequip(player, slot) {
+  const result = unequipItem(player, slot);
+  if (!result.ok) return result.reason;
+  addItemToInventory(player, result.itemId, 1);
+  persistPlayer(player);
+  return `${(getItemRuntime(result.itemId) || {}).name || result.itemId} unequipped.`;
+}
+
+function handleShop() { return renderVendorStock(); }
+
+function handleBuy(player, itemText) {
+  const entry = findVendorEntry(itemText);
+  if (!entry) return 'That item is not sold here.';
+  if ((player.zeni || 0) < entry.price) return 'Not enough zeni.';
+  player.zeni -= entry.price;
+  addItemToInventory(player, entry.itemId, 1);
+  persistPlayer(player);
+  return `You buy ${(getItemRuntime(entry.itemId) || {}).name || entry.itemId} for ${entry.price} zeni.`;
+}
+
+function handleSell(player, itemText) {
+  const key = normalizeKey(itemText);
+  if (!key) return 'Sell what?';
+  ensureInventory(player);
+  const slot = player.inventory.find((entry) => entry.itemId === key && entry.qty > 0);
+  if (!slot) return 'You do not have that item.';
+  const item = getItemRuntime(key);
+  const value = (item && item.value) || 5;
+  slot.qty -= 1;
+  if (slot.qty <= 0) player.inventory = player.inventory.filter((e) => e !== slot);
+  player.zeni = (player.zeni || 0) + value;
+  persistPlayer(player);
+  return `You sell ${item ? item.name : key} for ${value} zeni.`;
+}
+
+function handleProgress(player) { return renderProgression(player); }
+
+function handleLearn(player, techText) {
+  const key = normalizeKey(techText);
+  if (!key) return 'Learn what?';
+  const result = learnTechnique(player, key);
+  if (!result.ok) return result.reason;
+  persistPlayer(player);
+  return `You learn ${result.technique.name}.`;
+}
+
+function handleGameCommand(player, line) {
+  const input = String(line || '').trim();
+  const normalized = input.toLowerCase();
+  if (!normalized) return '';
+  if (normalized.startsWith('say ')) return handleSay(player, input);
+  if (['north', 'south', 'east', 'west', 'n', 's', 'e', 'w'].includes(normalized)) {
+    const map = { n: 'north', s: 'south', e: 'east', w: 'west' };
+    return movePlayer(player, map[normalized] || normalized);
+  }
+  const [cmd, subcmd, ...restWords] = input.split(/\s+/);
+  const rest = [subcmd, ...restWords].filter(Boolean).join(' ');
+  switch (cmd.toLowerCase()) {
+    case 'help': return 'Commands: help, look, stats, who, say <msg>, scan, inv, equip <item>, unequip <slot>, gear, shop, buy <item>, sell <item>, use <item>, progress, learn <technique>, pvp [on|off], follow <party member>, unfollow, party invite <name>, party accept <name>, party leave, party disband, party list, punch <target>, kick <target>, blast <target>, beam <target>, north/south/east/west, charge, meditate, quit';
+    case 'look': return renderRoom(player);
+    case 'stats': return renderStats(player);
+    case 'who': return handleWho();
+    case 'scan':
+    case 'pl': return handleScan(player);
+    case 'inv':
+    case 'inventory': return handleInventory(player);
+    case 'use': return handleUse(player, rest);
+    case 'gear':
+    case 'equipment': return handleEquipment(player);
+    case 'equip': return handleEquip(player, rest);
+    case 'unequip': return handleUnequip(player, rest);
+    case 'shop': return handleShop();
+    case 'buy': return handleBuy(player, rest);
+    case 'sell': return handleSell(player, rest);
+    case 'progress':
+    case 'skills': return handleProgress(player);
+    case 'learn': return handleLearn(player, rest);
+    case 'pvp': return handlePvpToggle(player, rest);
+    case 'follow': return handleFollow(player, rest);
+    case 'unfollow': return handleUnfollow(player);
+    case 'party': {
+      const action = String(subcmd || '').toLowerCase();
+      const arg = restWords.join(' ');
+      if (action === 'invite') return handlePartyInvite(player, arg);
+      if (action === 'accept') return handlePartyAccept(player, arg);
+      if (action === 'leave') return handlePartyLeave(player);
+      if (action === 'disband') return handlePartyDisband(player);
+      if (action === 'list') return handlePartyList(player);
+      return 'Use: party invite|accept|leave|disband|list';
+    }
+    case 'punch':
+    case 'fight':
+    case 'attack': return useTechnique(player, 'punch', rest);
+    case 'kick': return useTechnique(player, 'kick', rest);
+    case 'blast': return useTechnique(player, 'blast', rest);
+    case 'beam': return useTechnique(player, 'beam', rest);
+    case 'charge': player.kiPool = Math.min(player.maxKiPool, player.kiPool + 10); persistPlayer(player); return 'You gather your energy and recover ki.';
+    case 'meditate': return handleUse(player, 'meditate');
+    case 'quit': persistPlayer(player); player.socket.end('Goodbye.\r\n'); return null;
+    default: return `Unknown command: ${input}`;
+  }
+}
+
+const server = net.createServer((socket) => {
+  const session = { state: 'ask-name', socket, buffer: '', pendingName: null, player: null };
+  socket.setEncoding('utf8');
+  writeLine(socket, `${config.motd} [unified server]`);
+  writeLine(socket, 'Enter character name:');
+  prompt(socket);
+  socket.on('data', (chunk) => {
+    session.buffer += chunk;
+    let newlineIndex;
+    while ((newlineIndex = session.buffer.indexOf('\n')) !== -1) {
+      const line = session.buffer.slice(0, newlineIndex).replace(/\r/g, '');
+      session.buffer = session.buffer.slice(newlineIndex + 1);
+      if (session.state === 'ask-name') {
+        const name = String(line || '').trim().toLowerCase();
+        if (!name) { writeLine(socket, 'Please enter a valid character name.'); prompt(socket); continue; }
+        session.pendingName = name;
+        if (persistedPlayers[name]) session.player = attachPlayer(persistedPlayers[name], socket);
+        else {
+          session.state = 'ask-race';
+          writeLine(socket, 'New character. Choose race: human, saiyan, namekian, android');
+          prompt(socket);
+          continue;
+        }
+      } else if (session.state === 'ask-race') {
+        const race = String(line || '').trim().toLowerCase();
+        const allowed = new Set(['human', 'saiyan', 'namekian', 'android']);
+        if (!allowed.has(race)) { writeLine(socket, 'Invalid race. Choose: human, saiyan, namekian, android'); prompt(socket); continue; }
+        const profile = createNewPlayer(session.pendingName, race);
+        persistPlayer(profile);
+        session.player = attachPlayer(profile, socket);
+      } else if (session.state === 'playing' && session.player) {
+        const response = handleGameCommand(session.player, line);
+        if (typeof response === 'string' && response.length) writeLine(socket, response);
+        if (!socket.destroyed) prompt(socket);
+        continue;
+      }
+      if (session.player) {
+        session.state = 'playing';
+        worldState.players.set(session.player.id, session.player);
+        registerSession(worldState, session.player, session);
+        addPlayerToRoom(worldState, session.player, session.player.roomId);
+        writeLine(socket, `Welcome, ${session.player.name}.`);
+        writeLine(socket, renderStats(session.player));
+        writeLine(socket, renderRoom(session.player));
+        roomBroadcast(session.player.roomId, `${session.player.name} enters the area.`, session.player.id);
+        prompt(socket);
+      }
+    }
+  });
+  function cleanup() {
+    if (session.player) {
+      persistPlayer(session.player);
+      clearFollowTarget(worldState, session.player.id);
+      leaveParty(worldState, session.player.id);
+      removePlayerFromRoom(worldState, session.player.id, session.player.roomId);
+      roomBroadcast(session.player.roomId, `${session.player.name} has disconnected.`, session.player.id);
+      unregisterSession(worldState, session.player.id);
+      worldState.players.delete(session.player.id);
+    }
+  }
+  socket.on('close', cleanup);
+  socket.on('error', cleanup);
+});
+
+server.listen(config.port, config.host, () => {
+  console.log(`Muddy unified server listening on ${config.host}:${config.port}`);
+});
