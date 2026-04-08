@@ -1,0 +1,20 @@
+{
+  "name": "muddy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private Dragon Ball Z MUD for family and friends.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "check": "npm run check --workspaces",
+    "dev:server": "npm run dev --workspace @muddy/server",
+    "dev:client": "npm run dev --workspace @muddy/client"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
+

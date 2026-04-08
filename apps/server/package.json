@@ -1,0 +1,22 @@
+{
+  "name": "@muddy/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "node --watch --loader ts-node/esm src/index.ts"
+  },
+  "dependencies": {
+    "@muddy/shared": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.0"
+  }
+}
+
