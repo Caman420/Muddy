@@ -8,6 +8,9 @@ export type ParsedCommand =
   | { type: "scan" }
   | { type: "rest" }
   | { type: "guard" }
+  | { type: "meditate" }
+  | { type: "charge" }
+  | { type: "train"; activity: "dash" | "weights" }
   | { type: "quit" }
   | { type: "move"; direction: Direction }
   | { type: "attack"; target: string }
@@ -60,6 +63,14 @@ export function parseCommand(raw: string): ParsedCommand {
     return { type: "guard" };
   }
 
+  if (normalized === "meditate") {
+    return { type: "meditate" };
+  }
+
+  if (normalized === "charge") {
+    return { type: "charge" };
+  }
+
   if (normalized === "quit" || normalized === "exit") {
     return { type: "quit" };
   }
@@ -80,6 +91,10 @@ export function parseCommand(raw: string): ParsedCommand {
 
   if (verb === "blast" && arg) {
     return { type: "blast", target: arg };
+  }
+
+  if (verb === "train" && (arg === "dash" || arg === "weights")) {
+    return { type: "train", activity: arg };
   }
 
   return { type: "unknown", raw };

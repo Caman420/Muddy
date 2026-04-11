@@ -5,4 +5,4 @@ build/
 .env.local
 coverage/
 *.log
-
+apps/server/data/*.json

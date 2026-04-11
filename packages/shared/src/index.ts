@@ -9,6 +9,13 @@ export type CharacterVitals = {
   ki: ResourcePool;
 };
 
+export type TrainingStats = {
+  strength: number;
+  durability: number;
+  speed: number;
+  kiControl: number;
+};
+
 export function formatPowerLevel(value: number): string {
   return value.toLocaleString("en-US");
 }
